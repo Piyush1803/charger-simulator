@@ -1,0 +1,26 @@
+connected; reading up to 25 events for up to 12s
+[ 0] state  cp=Online conn=Charging tx=1001 energy=0 power=0 cur=22000
+[ 1] log    INFO  stop charging requested {"connector":1}
+[ 2] state  cp=Online conn=Finishing tx=1001 energy=2 power=0 cur=22000
+[ 3] ocpp   OUT CALL StatusNotification {"connectorId":1,"errorCode":"NoError","status":"Finishing","timestamp":"2026-06…
+[ 4] ocpp   OUT CALL StopTransaction {"idTag":"TESTRFID0001","meterStop":2,"timestamp":"2026-06-01T07:40:04.1701345Z"…
+[ 5] ocpp   IN CALLRESULT StatusNotification {} rt=1ms
+[ 6] ocpp   IN CALLRESULT StopTransaction {"idTagInfo":{"status":"Accepted"}} rt=1ms
+[ 7] log    INFO  transaction stopped {"duration":"0s","energy_wh":2,"reason":"Local","tx_id":1001}
+[ 8] state  cp=Online conn=Finishing tx=<nil> energy=2 power=0 cur=22000
+[ 9] state  cp=Online conn=Available tx=<nil> energy=2 power=0 cur=22000
+[10] ocpp   OUT CALL StatusNotification {"connectorId":1,"errorCode":"NoError","status":"Available","timestamp":"2026-06…
+[11] ocpp   IN CALLRESULT StatusNotification {}
+[12] log    INFO  gun plugged in {"connector":1}
+[13] state  cp=Online conn=Preparing tx=<nil> energy=2 power=0 cur=22000
+[14] ocpp   OUT CALL StatusNotification {"connectorId":1,"errorCode":"NoError","status":"Preparing","timestamp":"2026-06…
+[15] ocpp   IN CALLRESULT StatusNotification {}
+[16] log    INFO  start charging requested {"connector":1,"id_tag":"BUGFIX-RFID"}
+[17] ocpp   OUT CALL Authorize {"idTag":"BUGFIX-RFID"}
+[18] ocpp   IN CALLRESULT Authorize {"idTagInfo":{"status":"Accepted"}} rt=1ms
+[19] log    INFO  authorize accepted {"id_tag":"BUGFIX-RFID"}
+[20] ocpp   OUT CALL StartTransaction {"connectorId":1,"idTag":"BUGFIX-RFID","meterStart":2,"timestamp":"2026-06-01T07…
+[21] ocpp   IN CALLRESULT StartTransaction {"idTagInfo":{"status":"Accepted"},"transactionId":1002} rt=1ms
+[22] state  cp=Online conn=Charging tx=1002 energy=2 power=0 cur=22000
+[23] ocpp   OUT CALL StatusNotification {"connectorId":1,"errorCode":"NoError","status":"Charging","timestamp":"2026-06-…
+[24] log    INFO  transaction started {"id_tag":"BUGFIX-RFID","meter_start_wh":2,"tx_id":1002}

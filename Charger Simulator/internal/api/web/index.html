@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>EV Charger Simulator</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+  <header id="top-bar">
+    <div class="brand">
+      <div>EV Charger Simulator</div>
+      <div class="brand-sub">Behaves like a real OCPP 1.6J charger from any CMS's perspective.</div>
+    </div>
+    <span id="conn-pill" class="pill pill-cp-disconnected">Disconnected</span>
+  </header>
+
+  <main>
+    <!-- 1. CONFIGURATION -->
+    <section id="config-section" class="card">
+      <div id="config-hero" class="config-hero">
+        <div class="hero-title">
+          <svg class="hero-icon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path d="M13 2 L4 14 L11 14 L10 22 L20 9 L13 9 Z" fill="currentColor" />
+          </svg>
+          <span>Spin up a virtual charger</span>
+        </div>
+        <div class="hero-sub">Point it at any OCPP 1.6J Central System and exercise the full charging flow end-to-end.
+        </div>
+      </div>
+      <div class="card-title">Configure charger</div>
+      <div class="card-body">
+        <form id="config-form">
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">CMS URL</span>
+              <input type="text" name="cms_url" value="wss://tobor-dev-ocpp.azurewebsites.net/ocpp" required>
+              <span class="field-hint">Use wss:// for TLS endpoints.</span>
+            </label>
+            <label class="field">
+              <span class="field-label">Charge Point ID</span>
+              <input type="text" name="cp_id" value="115" required>
+              <span class="field-hint">Must exist in your CMS's whitelist.</span>
+            </label>
+          </div>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Basic Auth User</span>
+              <input type="text" name="user" value="admin">
+            </label>
+            <label class="field">
+              <span class="field-label">Basic Auth Password <small class="dim">(default admin / admin)</small></span>
+              <input type="password" name="pass" value="admin">
+              <span class="field-hint">Most chargers default to admin / admin.</span>
+            </label>
+          </div>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Vendor</span>
+              <input type="text" name="vendor" value="Piyush's Garage">
+            </label>
+            <label class="field">
+              <span class="field-label">Model</span>
+              <input type="text" name="model" value="Virtual Charger 1.0">
+            </label>
+          </div>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Charger Type</span>
+              <select name="charger_type">
+                <option value="AC" selected>AC</option>
+                <option value="DC">DC</option>
+              </select>
+              <span class="field-hint">AC for Type 2 / Bharat AC; DC for CCS2 / Bharat DC.</span>
+            </label>
+            <label class="field">
+              <span class="field-label">Connectors</span>
+              <select name="num_connectors">
+                <option value="1" selected>1</option>
+                <option value="2">2</option>
+              </select>
+              <span class="field-hint">Number of physical connectors on this charger.</span>
+            </label>
+          </div>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Max Power (kW)</span>
+              <input type="number" name="max_kw" value="7.2" step="0.1" min="0.1">
+            </label>
+            <label class="field ac-only">
+              <span class="field-label">Phases</span>
+              <select name="phases">
+                <option value="1" selected>1</option>
+                <option value="3">3</option>
+              </select>
+              <span class="field-hint">AC only — number of supply phases.</span>
+            </label>
+            <label class="field">
+              <span class="field-label">Nominal Voltage (V)</span>
+              <input type="number" name="voltage" value="240" step="1" min="1">
+            </label>
+          </div>
+
+          <div class="field-row dc-only hidden">
+            <label class="field">
+              <span class="field-label">Battery Capacity (kWh)</span>
+              <input type="number" name="battery_capacity_kwh" value="60" step="0.1" min="0.1" required>
+              <span class="field-hint">DC only — usable pack capacity of the vehicle.</span>
+            </label>
+            <label class="field">
+              <span class="field-label">Initial SoC (%)</span>
+              <input type="number" name="initial_soc" value="20" step="1" min="0" max="100" required>
+              <span class="field-hint">DC only — state of charge at session start.</span>
+            </label>
+          </div>
+
+          <div class="field-row">
+            <label class="field">
+              <span class="field-label">Heartbeat Interval (s)</span>
+              <input type="number" name="heartbeat_s" value="60" step="1" min="1">
+            </label>
+            <label class="field">
+              <span class="field-label">Meter Interval (s)</span>
+              <input type="number" name="meter_s" value="30" step="1" min="1">
+            </label>
+          </div>
+
+          <button type="submit" class="btn btn-primary btn-block">Connect</button>
+          <div id="config-error" class="hidden"></div>
+        </form>
+      </div>
+    </section>
+
+    <!-- 2. STATUS — initially hidden -->
+    <section id="status-section" class="card hidden">
+      <div class="card-title">Charger</div>
+      <div class="card-body">
+        <div id="connector-tabs" class="connector-tabs hidden">
+          <button id="connector-tab-1" class="connector-tab connector-tab-active" data-connector="1"
+            data-status="Available" type="button">Connector 1 — <span class="conn-tab-status">Available</span></button>
+          <button id="connector-tab-2" class="connector-tab" data-connector="2" data-status="Available"
+            type="button">Connector 2 — <span class="conn-tab-status">Available</span></button>
+        </div>
+        <svg id="charger-art" class="charger-art is-available" viewBox="0 0 600 180" xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true">
+          <path class="art-cable" d="M140,95 C 220,95 300,95 380,95" />
+          <g class="art-flow" aria-hidden="true">
+            <circle class="art-flow-dot" cx="140" cy="95" r="4" />
+            <circle class="art-flow-dot" cx="140" cy="95" r="4" />
+            <circle class="art-flow-dot" cx="140" cy="95" r="4" />
+            <circle class="art-flow-dot" cx="140" cy="95" r="4" />
+          </g>
+          <g class="art-charger">
+            <rect class="art-charger-body" x="20" y="30" width="120" height="130" rx="14" />
+            <rect class="art-charger-screen" x="35" y="50" width="90" height="40" rx="6" />
+            <text class="art-charger-screen-text" x="80" y="76" text-anchor="middle">READY</text>
+            <text class="art-charger-brand" x="80" y="110" text-anchor="middle">TobOR</text>
+            <circle class="art-led art-led-1" cx="55" cy="135" r="4" />
+            <circle class="art-led art-led-2" cx="80" cy="135" r="4" />
+            <circle class="art-led art-led-3" cx="105" cy="135" r="4" />
+          </g>
+          <g class="art-ev">
+            <ellipse class="art-ev-glow" cx="490" cy="100" rx="120" ry="55" />
+            <path class="art-ev-body" d="M395,110 L405,70 Q420,55 460,55 L530,55 Q555,55 575,75 L585,110 Z" />
+            <rect class="art-ev-body" x="395" y="110" width="195" height="22" rx="6" />
+            <circle class="art-ev-wheel" cx="430" cy="138" r="13" />
+            <circle class="art-ev-wheel" cx="555" cy="138" r="13" />
+            <rect class="art-ev-port" x="390" y="88" width="10" height="22" rx="2" />
+          </g>
+        </svg>
+
+        <div class="card-row identity-row">
+          <div>CP ID <strong id="cp-id-val">—</strong></div>
+          <div>Model <span id="vendor-val">—</span> <span id="model-val">—</span></div>
+          <div>CMS <span id="cms-url-val" class="mono">—</span></div>
+        </div>
+        <div class="card-row status-row">
+          <div>Connector <span id="connector-pill" class="pill pill-conn-Available">Available</span><span
+              id="charger-type-badge" class="charger-type-badge hidden">DC</span></div>
+          <div>Transaction <span id="tx-id-val">—</span></div>
+          <div>idTag <span id="id-tag-val">—</span></div>
+          <div>Duration <span id="duration-val">—</span></div>
+        </div>
+
+        <div class="meter-grid">
+          <div class="meter-card">
+            <div><span class="meter-value" id="energy-val">0</span><span class="meter-unit">Wh</span></div>
+            <div class="meter-label">Energy</div>
+          </div>
+          <div class="meter-card">
+            <div><span class="meter-value" id="power-val">0</span><span class="meter-unit">W</span></div>
+            <div class="meter-label">Power</div>
+          </div>
+          <div class="meter-card">
+            <div><span class="meter-value" id="voltage-val">0</span><span class="meter-unit">V</span></div>
+            <div class="meter-label">Voltage</div>
+          </div>
+          <div class="meter-card">
+            <div><span class="meter-value" id="current-val">0</span><span class="meter-unit">A</span></div>
+            <div class="meter-label">Current</div>
+          </div>
+          <div id="soc-tile" class="meter-card hidden">
+            <div><span class="meter-value" id="soc-val">0</span><span class="meter-unit">%</span></div>
+            <div class="meter-label">State of Charge</div>
+          </div>
+        </div>
+
+        <div class="power-chart-card">
+          <div class="power-chart-header">
+            <span class="power-chart-title">Power · last 2 min</span>
+            <span class="power-chart-now"><strong id="power-chart-now-val">0</strong> W</span>
+          </div>
+          <div class="power-chart-wrap">
+            <canvas id="power-chart" width="800" height="140"></canvas>
+            <span id="power-chart-empty" class="power-chart-empty">Waiting for samples…</span>
+          </div>
+        </div>
+
+        <div class="power-controls">
+          <span>Power limit</span>
+          <button id="btn-load-down" class="btn btn-neutral btn-small">− 1 kW</button>
+          <input id="power-slider" type="range" min="1" max="22" step="1" value="22" />
+          <button id="btn-load-up" class="btn btn-neutral btn-small">+ 1 kW</button>
+          <span><strong id="max-power-current-val">22.0 kW</strong> / <span id="max-power-configured-val"
+              class="dim">22.0 kW</span></span>
+        </div>
+
+        <div class="card-row meter-fault-row">
+          <span class="meter-fault-label">Energy-meter fault</span>
+          <select id="meter-fault-select" class="meter-fault-select">
+            <option value="none">None — healthy meter</option>
+            <option value="dead_silent">Dead — send no MeterValues</option>
+            <option value="dead_empty">Dead — empty sampledValue (malformed)</option>
+            <option value="dead_zero">Dead — zeroed V / I / P</option>
+            <option value="no_current">Voltage but no current</option>
+            <option value="no_vip">No voltage / current / power</option>
+          </select>
+          <span id="meter-fault-badge" class="meter-fault-badge hidden">METER FAULT</span>
+          <span class="field-hint meter-fault-hint">Drops measurands from MeterValues while charging. Heartbeats keep flowing; status stays unchanged.</span>
+        </div>
+
+        <div class="card-row controls">
+          <button id="btn-plug-in" class="btn btn-primary btn-toggle">Plug In Gun</button>
+          <span class="start-cluster">
+            <input id="start-id-tag" type="text" value="TESTRFID0001" />
+            <button id="btn-start" class="btn btn-success">Start Charging</button>
+          </span>
+          <button id="btn-stop" class="btn btn-warning">Stop Charging</button>
+          <button id="btn-emergency" class="btn btn-emergency">EMERGENCY STOP</button>
+          <button id="btn-clear-fault" class="btn btn-neutral hidden">Clear Fault</button>
+          <button id="btn-offline" class="btn btn-neutral">Go Offline</button>
+          <button id="btn-disconnect" class="btn btn-neutral">Disconnect</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. LOG -->
+    <section id="log-section" class="card hidden">
+      <div class="card-title">Live OCPP log <button id="btn-clear-log" class="btn btn-neutral btn-small">clear</button>
+      </div>
+      <div class="card-body">
+        <div id="log-stream"></div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+
+</html>
