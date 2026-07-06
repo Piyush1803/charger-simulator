@@ -23,6 +23,7 @@ import (
 	"github.com/tobor/charger-simulator/internal/actor"
 	"github.com/tobor/charger-simulator/internal/api/web"
 	"github.com/tobor/charger-simulator/internal/config"
+	"github.com/tobor/charger-simulator/internal/session"
 	"github.com/tobor/charger-simulator/internal/sim/meter"
 )
 
@@ -41,6 +42,13 @@ type wsClient struct {
 type Server struct {
 	log *slog.Logger
 
+	// store persists open transactions; shared across successive chargers so a
+	// reconfigured or restarted charger recovers its interrupted sessions.
+	store session.Store
+	// dataDir is where the last-applied charger config is persisted so the
+	// worker can auto-relaunch the charger after a process restart.
+	dataDir string
+
 	mu             sync.RWMutex
 	current        *actor.Charger
 	cancelCharger  context.CancelFunc
@@ -50,13 +58,17 @@ type Server struct {
 	clients map[*wsClient]struct{}
 }
 
-// New constructs an idle Server. No charger is running until /api/configure.
-func New(log *slog.Logger) *Server {
+// New constructs an idle Server. No charger is running until /api/configure (or
+// RestorePersistedCharger, if a config was persisted). store and dataDir may be
+// empty/nil to run without persistence.
+func New(log *slog.Logger, store session.Store, dataDir string) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Server{
 		log:     log,
+		store:   store,
+		dataDir: dataDir,
 		clients: make(map[*wsClient]struct{}),
 	}
 }
@@ -312,6 +324,9 @@ func (s *Server) handleConfigure(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.startCharger(cfg)
+	// Persist so the charger auto-relaunches (and recovers interrupted sessions)
+	// after a process restart.
+	s.persistConfig(cfg)
 
 	s.log.Info("charger configured",
 		"cp_id", cfg.CPID,
@@ -338,7 +353,7 @@ func (s *Server) startCharger(cfg config.ChargerConfig) {
 	s.current = nil
 	s.currentCfg = nil
 
-	ch := actor.NewCharger(cfg, s.log)
+	ch := actor.NewCharger(cfg, s.log, s.store)
 	ctx, cancel := context.WithCancel(context.Background())
 	fanoutCtx, fanoutCancel := context.WithCancel(context.Background())
 
@@ -376,6 +391,9 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 	s.current = nil
 	s.currentCfg = nil
 	s.mu.Unlock()
+
+	// Operator explicitly disconnected — don't auto-relaunch on next start.
+	s.clearPersistedConfig()
 
 	s.log.Info("charger disconnected via API")
 	w.WriteHeader(http.StatusNoContent)

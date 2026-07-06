@@ -31,6 +31,14 @@ type ChargerConfig struct {
 	HeartbeatInterval time.Duration
 	MeterInterval     time.Duration
 
+	// ---- Reconnect (unexpected CMS drop) ----
+	// After an unexpected link loss the charger redials with exponential
+	// backoff: the first wait is ReconnectInitialBackoff, doubling each failed
+	// attempt up to ReconnectMaxBackoff. Zero values fall back to package
+	// defaults (1s initial, 30s cap).
+	ReconnectInitialBackoff time.Duration
+	ReconnectMaxBackoff     time.Duration
+
 	// ---- Topology ----
 	// Type is "AC" or "DC". All connectors on a single charger share the
 	// same type (mixed-mode chargers like AC+DC combo are out of scope for

@@ -24,7 +24,6 @@ package actor
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -35,6 +34,7 @@ import (
 
 	"github.com/tobor/charger-simulator/internal/config"
 	"github.com/tobor/charger-simulator/internal/ocpp/j16"
+	"github.com/tobor/charger-simulator/internal/session"
 	"github.com/tobor/charger-simulator/internal/sim/meter"
 	"github.com/tobor/charger-simulator/internal/transport/ws"
 )
@@ -55,6 +55,11 @@ const (
 	// While offline the WebSocket to the CMS is dropped (so the CMS observes the
 	// disconnect) and all user actions, including StartCharging, are rejected.
 	cpOffline
+	// cpReconnecting is an UNEXPECTED drop (CMS shut down / restarted / network
+	// loss) that the charger is auto-recovering from with exponential backoff.
+	// The process and all session state stay alive; on a successful reboot any
+	// interrupted session is closed out with a StopTransaction.
+	cpReconnecting
 )
 
 func (s cpState) String() string {
@@ -67,6 +72,8 @@ func (s cpState) String() string {
 		return "Disconnected"
 	case cpOffline:
 		return "Offline"
+	case cpReconnecting:
+		return "Reconnecting"
 	}
 	return "Unknown"
 }
@@ -312,10 +319,15 @@ type Charger struct {
 
 	events   chan Event
 	snapshot atomic.Pointer[StateSnapshot]
+
+	// store persists open transactions so they can be closed out with a
+	// StopTransaction after any CMS-link interruption, including a full process
+	// restart. May be nil (persistence + interrupted-session recovery disabled).
+	store session.Store
 }
 
 // NewCharger constructs but does not start the actor.
-func NewCharger(cfg config.ChargerConfig, log *slog.Logger) *Charger {
+func NewCharger(cfg config.ChargerConfig, log *slog.Logger, store session.Store) *Charger {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -355,6 +367,7 @@ func NewCharger(cfg config.ChargerConfig, log *slog.Logger) *Charger {
 		pending:      make(map[string]*pendingCall),
 		cmdCh:        make(chan Command, 32),
 		events:       make(chan Event, 256),
+		store:        store,
 	}
 	// Publish an initial snapshot so dashboards reading State() before Run starts
 	// get something sensible.
@@ -489,8 +502,17 @@ func (c *Charger) Run(ctx context.Context) error {
 					inbound = nil
 					continue
 				}
-				c.log.Warn("ws closed by remote")
-				return errors.New("ws closed")
+				// Unexpected drop (CMS shut down / restarted / network loss) but
+				// our process is fine. Keep all session state and auto-reconnect
+				// with backoff; a successful reboot closes out any interrupted
+				// session via recoverInterruptedSessions.
+				c.log.Warn("ws closed by remote — auto-reconnecting")
+				c.onUnexpectedDrop()
+				inbound = c.reconnectWithBackoff(ctx)
+				if inbound == nil {
+					return nil // ctx cancelled during backoff → clean shutdown
+				}
+				continue
 			}
 			if c.offline {
 				// Late frames buffered before the link dropped — ignore them.
@@ -600,13 +622,21 @@ func (c *Charger) sendBoot(ctx context.Context) error {
 				})
 				c.publishSnapshot()
 				c.sendStatus(ctx, 0, j16.StatusAvailable, j16.ErrorNoError)
-				// Re-announce each connector's CURRENT status. On the first boot
-				// every connector is Available, so this matches the original
-				// behaviour; on a reconnect (GoOnline) it preserves an in-flight
-				// session instead of resetting it to Available.
+				// Re-announce each connector's CURRENT status — EXCEPT any that
+				// still holds a live txID. Those had their session interrupted by
+				// the outage; recoverInterruptedSessions closes them out with a
+				// StopTransaction and drives them back to Available, so we skip
+				// re-announcing a stale Charging here.
 				for id, cn := range c.connectors {
+					if cn.txID != 0 {
+						continue
+					}
 					c.sendStatus(ctx, id, cn.status, cn.errorCode)
 				}
+				// Close out any session interrupted by an outage (offline button,
+				// CMS restart, or process restart). Covers all three with one
+				// store-driven path; a no-op on a clean first boot.
+				c.recoverInterruptedSessions(ctx)
 			case j16.RegPending:
 				c.log.Warn("boot pending — CMS asked us to wait")
 				c.emitLog("warn", "boot pending", nil)
@@ -740,6 +770,23 @@ func (c *Charger) sendStartTransaction(ctx context.Context, connectorID int, idT
 			cn.txID = resp.TransactionId
 			cn.startPending = false
 			cn.meterEng.Start(now, float64(meterStart))
+			// Persist the open session so it can be closed out with a
+			// StopTransaction if the CMS link is interrupted (offline button,
+			// CMS restart, or a full process restart).
+			if c.store != nil {
+				if err := c.store.Put(session.OpenSession{
+					CPID:         c.cfg.CPID,
+					ConnectorID:  connectorID,
+					TxID:         resp.TransactionId,
+					IdTag:        idTag,
+					MeterStartWh: meterStart,
+					StartedAt:    now,
+					LastMeterWh:  meterStart, // no tick yet → stop==start is valid
+					LastMeterAt:  now,
+				}); err != nil {
+					c.log.Error("persist open session failed", "tx_id", resp.TransactionId, "err", err)
+				}
+			}
 			c.sendStatus(ctx, connectorID, j16.StatusCharging, j16.ErrorNoError)
 			c.log.Info("transaction started",
 				"tx_id", resp.TransactionId,
@@ -780,6 +827,11 @@ func (c *Charger) sendStopTransaction(ctx context.Context, connectorID int, reas
 	_ = c.call(ctx, "StopTransaction", req,
 		func(payload json.RawMessage) {
 			cn.txID = 0
+			// The session is closed on the CMS — drop its persisted record so it
+			// is not replayed as an interrupted session on the next boot.
+			if c.store != nil {
+				_ = c.store.Delete(c.cfg.CPID, connectorID)
+			}
 			wh := meterStop - cn.sessionStartWh
 			c.log.Info("transaction stopped",
 				"tx_id", txID,
@@ -802,6 +854,76 @@ func (c *Charger) sendStopTransaction(ctx context.Context, connectorID int, reas
 		}, nil)
 }
 
+// recoverInterruptedSessions closes out every session that was open when the CMS
+// link was last interrupted. It is called on every boot-accepted, so it covers
+// all three interruption modes with one path: the operator offline/online
+// button, an unexpected CMS drop (via auto-reconnect), and a full process
+// restart (where the in-memory txIDs are gone but the store still holds the
+// records). Each recovered session is closed with StopTransaction(PowerLoss).
+func (c *Charger) recoverInterruptedSessions(ctx context.Context) {
+	if c.store == nil {
+		return
+	}
+	open, err := c.store.LoadOpen(c.cfg.CPID)
+	if err != nil {
+		c.log.Error("recover: load open sessions failed", "err", err)
+		return
+	}
+	for _, rec := range open {
+		c.log.Warn("recovering interrupted session → StopTransaction(PowerLoss)",
+			"tx_id", rec.TxID, "connector", rec.ConnectorID)
+		c.emitLog("warn", "recovering session interrupted by outage (PowerLoss)", map[string]any{
+			"tx_id": rec.TxID, "connector": rec.ConnectorID,
+		})
+		c.stopTransactionFromRecord(ctx, rec)
+	}
+}
+
+// stopTransactionFromRecord sends a StopTransaction built purely from a persisted
+// record (no live session state required), then — on the CMS's CALLRESULT —
+// deletes the record and returns the connector to Available. Deleting only on
+// the reply makes recovery at-least-once: if the link drops again before the
+// reply, the identical StopTransaction is replayed on the next boot (a real CMS
+// dedupes by transactionId).
+func (c *Charger) stopTransactionFromRecord(ctx context.Context, rec session.OpenSession) {
+	connID := rec.ConnectorID
+	req := j16.StopTransactionReq{
+		IdTag:         rec.IdTag,
+		MeterStop:     rec.LastMeterWh, // last reading seen before the outage
+		Timestamp:     rec.LastMeterAt,
+		TransactionId: rec.TxID,
+		Reason:        j16.StopReasonPowerLoss,
+	}
+	_ = c.call(ctx, "StopTransaction", req,
+		func(payload json.RawMessage) {
+			if c.store != nil {
+				if err := c.store.Delete(rec.CPID, connID); err != nil {
+					c.log.Error("recover: delete record failed", "tx_id", rec.TxID, "err", err)
+				}
+			}
+			c.log.Info("interrupted session closed on CMS", "tx_id", rec.TxID, "connector", connID)
+			c.emitLog("info", "interrupted session closed on CMS", map[string]any{
+				"tx_id": rec.TxID, "connector": connID,
+			})
+			// Reconcile in-memory state whether or not this connector still holds
+			// the txID (same-process outage → it does; cold restart → it doesn't).
+			if cn, ok := c.connectors[connID]; ok {
+				cn.txID = 0
+				cn.startPending = false
+				cn.sessionIdTag = ""
+				cn.sessionStartedAt = time.Time{}
+				cn.sessionStartWh = 0
+				c.sendStatus(ctx, connID, j16.StatusAvailable, j16.ErrorNoError)
+			} else {
+				// Connector no longer exists in the current config (e.g. 2 guns
+				// → 1). The tx is closed on the CMS; nothing to reconcile.
+				c.log.Warn("recover: connector absent in current config; tx closed, no reconcile",
+					"connector", connID)
+				c.publishSnapshot()
+			}
+		}, nil)
+}
+
 func (c *Charger) sendMeterValues(ctx context.Context, connectorID int) {
 	cn, ok := c.connectors[connectorID]
 	if !ok || cn.txID == 0 {
@@ -809,6 +931,14 @@ func (c *Charger) sendMeterValues(ctx context.Context, connectorID int) {
 	}
 	snap := cn.meterEng.Sample(time.Now().UTC())
 	txID := cn.txID
+
+	// Refresh the persisted last-seen meter reading. Done before the fault
+	// branch so the record still advances when telemetry is suppressed, and
+	// only while online — so on an outage the record freezes at this value,
+	// which the recovery StopTransaction reports as meterStop.
+	if c.store != nil {
+		_ = c.store.UpdateMeter(c.cfg.CPID, connectorID, int(snap.EnergyWh), snap.At)
+	}
 
 	// Inject any armed energy-meter fault. send=false means a total telemetry
 	// blackout — we drop the whole MeterValues CALL (heartbeats keep flowing).
@@ -1103,17 +1233,15 @@ func (c *Charger) handleGoOnline(ctx context.Context) <-chan []byte {
 	c.cpState = cpBooting
 	c.publishSnapshot()
 
-	wsClient := ws.New(c.cfg.CMSURL, c.log.With("layer", "ws"))
-	wsClient.BasicUser = c.cfg.BasicAuthUser
-	wsClient.BasicPass = c.cfg.BasicAuthPass
-	if err := wsClient.Connect(ctx); err != nil {
+	// Manual reconnect is a SINGLE attempt — the operator retries via the button
+	// if it fails. (Unexpected drops use reconnectWithBackoff instead.)
+	if err := c.dialAndSwap(ctx); err != nil {
 		c.log.Error("reconnect failed", "err", err)
 		c.emitLog("error", "reconnect failed — still offline", map[string]any{"err": err.Error()})
 		c.cpState = cpOffline // stay offline; operator can retry GoOnline
 		c.publishSnapshot()
 		return nil
 	}
-	c.ws = wsClient
 	c.offline = false
 	c.emitLog("info", "reconnected — sending BootNotification", nil)
 	if err := c.sendBoot(ctx); err != nil {
@@ -1121,6 +1249,85 @@ func (c *Charger) handleGoOnline(ctx context.Context) <-chan []byte {
 		c.emitLog("error", "boot after reconnect failed", map[string]any{"err": err.Error()})
 	}
 	return c.ws.Inbound()
+}
+
+// Backoff defaults for auto-reconnect after an unexpected CMS drop. Overridable
+// per charger via config.ChargerConfig.Reconnect{Initial,Max}Backoff.
+const (
+	defaultReconnectInitial = 1 * time.Second
+	defaultReconnectMax     = 30 * time.Second
+)
+
+// dialAndSwap builds a fresh ws.Client (the old one is single-use after Close),
+// copies the auth creds, dials, and on success swaps it into c.ws. It does NOT
+// send BootNotification. Shared by the manual GoOnline path and auto-reconnect.
+func (c *Charger) dialAndSwap(ctx context.Context) error {
+	wsClient := ws.New(c.cfg.CMSURL, c.log.With("layer", "ws"))
+	wsClient.BasicUser = c.cfg.BasicAuthUser
+	wsClient.BasicPass = c.cfg.BasicAuthPass
+	if err := wsClient.Connect(ctx); err != nil {
+		return err
+	}
+	c.ws = wsClient
+	return nil
+}
+
+// onUnexpectedDrop transitions into the auto-reconnecting state after the CMS
+// link is lost unexpectedly. Session state (txID, connector status) is kept; the
+// persisted records already hold the last-online meter reading, so no in-memory
+// freeze is needed. In-flight CALLs are discarded — their replies will never
+// arrive over the dead socket.
+func (c *Charger) onUnexpectedDrop() {
+	c.cpState = cpReconnecting
+	c.pending = make(map[string]*pendingCall)
+	c.emitLog("warn", "CMS link lost — auto-reconnecting with backoff", nil)
+	c.publishSnapshot()
+}
+
+// reconnectWithBackoff loops dial→boot until it succeeds (returning the new
+// inbound channel) or ctx is cancelled (returning nil). The wait between
+// attempts is the only place the actor blocks, and it stays cancellable via
+// ctx.Done(). A successful BootNotification triggers recoverInterruptedSessions
+// in the RegAccepted branch, closing out any session the outage interrupted.
+func (c *Charger) reconnectWithBackoff(ctx context.Context) <-chan []byte {
+	backoff := c.cfg.ReconnectInitialBackoff
+	if backoff <= 0 {
+		backoff = defaultReconnectInitial
+	}
+	maxB := c.cfg.ReconnectMaxBackoff
+	if maxB <= 0 {
+		maxB = defaultReconnectMax
+	}
+	for attempt := 1; ; attempt++ {
+		if err := c.dialAndSwap(ctx); err == nil {
+			// Dial up. Boot; RegAccepted flips cpState to online and runs
+			// recovery. Leave cpReconnecting until the boot RESULT lands.
+			if err := c.sendBoot(ctx); err != nil {
+				c.log.Error("reconnect boot send failed", "err", err)
+				c.ws.Close() // fall through to another backoff cycle
+			} else {
+				c.emitLog("info", "reconnected — BootNotification sent", map[string]any{"attempt": attempt})
+				return c.ws.Inbound()
+			}
+		} else {
+			c.log.Warn("reconnect attempt failed",
+				"attempt", attempt, "backoff", backoff.String(), "err", err)
+			c.emitLog("warn", "reconnect attempt failed", map[string]any{
+				"attempt": attempt, "backoff": backoff.String(),
+			})
+		}
+
+		t := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return nil
+		case <-t.C:
+		}
+		if backoff *= 2; backoff > maxB {
+			backoff = maxB
+		}
+	}
 }
 
 func (c *Charger) handlePlugIn(ctx context.Context, v CmdPlugIn) {
@@ -1245,6 +1452,8 @@ func (c *Charger) connectivityReason() string {
 		return "charger is offline"
 	case cpBooting:
 		return "charger not online yet"
+	case cpReconnecting:
+		return "charger reconnecting to CMS"
 	case cpDisconnected:
 		return "charger disconnected"
 	default:

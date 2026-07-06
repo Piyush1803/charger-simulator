@@ -14,16 +14,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/tobor/charger-simulator/internal/api"
+	"github.com/tobor/charger-simulator/internal/session"
 )
 
 func main() {
 	httpAddr := flag.String("http-addr", ":8080", "Dashboard HTTP listen address")
 	logLevel := flag.String("log", "info", "Log level: debug|info|warn|error")
+	dataDir := flag.String("data-dir", "./data", "Directory for persisted open sessions + charger config")
 	flag.Parse()
 
 	var lvl slog.Level
@@ -32,7 +35,16 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: lvl}))
 
-	srv := api.New(log)
+	store, err := session.NewFileStore(filepath.Join(*dataDir, "sessions.json"), log)
+	if err != nil {
+		log.Error("session store init failed; continuing without persistence", "err", err)
+		store = nil
+	}
+
+	srv := api.New(log, store, *dataDir)
+	// Re-launch the charger persisted before the last shutdown/crash so it can
+	// send a StopTransaction for any session interrupted by the restart.
+	srv.RestorePersistedCharger()
 
 	httpSrv := &http.Server{
 		Addr:              *httpAddr,
